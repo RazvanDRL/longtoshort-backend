@@ -1,1 +1,1 @@
-web: bun run dev
+worker: bun run dev
