@@ -25,7 +25,7 @@ let preditctionID: string | null = null;
 
 async function fetchVideo(path: string) {
     try {
-        const response = await fetch(`http://localhost:3000/api/generate-signed-url?key=${path}?bucket=upload-bucket`, {
+        const response = await fetch(`${process.env.SITE_URL}/api/generate-signed-url?key=${path}?bucket=upload-bucket`, {
             method: 'POST'
         });
 
