@@ -1,13 +1,20 @@
 import Replicate, { Prediction } from "replicate";
+import S3 from 'aws-sdk/clients/s3.js';
 import { $ } from "bun";
-
 import { supabase } from "./scripts/supabaseClient";
-
-const version = "3cafb09bd68dc82d1c09f7f91d5f67451d61242b8acf83e9ad4e27422dc51b28";
 
 const replicate = new Replicate({
     auth: process.env.REPLICATE_API_TOKEN,
 });
+
+const s3 = new S3({
+    endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID!}.r2.cloudflarestorage.com`,
+    accessKeyId: process.env.CLOUDFLARE_AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.CLOUDFLARE_AWS_SECRET_ACCESS_KEY!,
+    signatureVersion: 'v4',
+});
+
+const version = "3cafb09bd68dc82d1c09f7f91d5f67451d61242b8acf83e9ad4e27422dc51b28";
 
 type queueItem = {
     id: string;
@@ -23,19 +30,10 @@ let lastKnownStatus: string | null = null;
 let lastKnownLogs: string | null = null;
 let preditctionID: string | null = null;
 
-async function fetchVideo(path: string) {
+async function fetchVideo(user_id: string, video_id: string) {
     try {
-        const response = await fetch(`${process.env.SITE_URL}/api/generate-signed-url?key=${path}?bucket=upload-bucket`, {
-            method: 'POST'
-        });
-
-        if (!response.ok) {
-            throw new Error('Failed to fetch signed URL');
-        }
-
-        const data = await response.json() as { url: string };
-
-        return data.url;
+        const url = await s3.getSignedUrlPromise('getObject', { Bucket: "upload-bucket", Key: `${user_id}/${video_id}.mp4`, Expires: 3600 });
+        return url;
     } catch (error) {
         console.error('Error fetching video:', error);
     }
@@ -43,8 +41,7 @@ async function fetchVideo(path: string) {
 
 async function processQueueItem(row: queueItem) {
     const path = `${row.user_id}/${row.video_id}.mp4`;
-
-    const url = await fetchVideo(path);
+    const url = await fetchVideo(row.user_id, row.video_id);
 
     if (url) {
         const controller = new AbortController();
