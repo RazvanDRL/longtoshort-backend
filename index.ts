@@ -50,6 +50,12 @@ async function processQueueItem(row: queueItem) {
         const timer = setTimeout(async () => {
             if (!cancelled) {
                 await abortPrediction(controller);
+                await supabase
+                    .from("processing_queue")
+                    .update([
+                        { status: "aborted" },
+                    ])
+                    .match({ id: row.id });
             }
         }, 600000); // 10 minutes
 
