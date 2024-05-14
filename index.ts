@@ -39,9 +39,38 @@ async function fetchVideo(user_id: string, video_id: string) {
     }
 }
 
+async function uploadVideo(user_id: string, video_id: string) {
+    try {
+        console.log('Compressing video');
+        await $`ffmpeg -i ${user_id}/${video_id}.mp4 -vf "scale=iw/2:ih/2" ${user_id}/${video_id}-compressed.mp4`;
+
+        console.log('Uploading video');
+        const file = Bun.file(`${user_id}/${video_id}-compressed.mp4`);
+
+        const response = await fetch(`
+        ${process.env.SITE_URL}/api/upload?key=${user_id}/${video_id}-compressed.mp4`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'video/mp4',
+            },
+            body: file,
+        });
+
+        if (!response.ok)
+            throw new Error(`Failed to upload video: ${response.statusText}`);
+        else
+            console.log('Video uploaded');
+    } catch (error) {
+        console.error('Error uploading video:', error);
+    }
+}
+
 async function processQueueItem(row: queueItem) {
-    const path = `${row.user_id}/${row.video_id}.mp4`;
-    const url = await fetchVideo(row.user_id, row.video_id);
+    const id = row.id;
+    const user_id = row.user_id;
+    const video_id = row.video_id;
+    const path = `${user_id}/${video_id}.mp4`;
+    const url = await fetchVideo(user_id, video_id);
 
     if (url) {
         const controller = new AbortController();
@@ -55,7 +84,7 @@ async function processQueueItem(row: queueItem) {
                     .update([
                         { status: "aborted" },
                     ])
-                    .match({ id: row.id });
+                    .match({ id: id });
             }
         }, 600000); // 10 minutes
 
@@ -85,7 +114,7 @@ async function processQueueItem(row: queueItem) {
                             .update([
                                 { status: progress.status },
                             ])
-                            .match({ id: row.id });
+                            .match({ id: id });
                         if (update_status_error) {
                             console.log(update_status_error);
                         }
@@ -100,7 +129,7 @@ async function processQueueItem(row: queueItem) {
                             .update([
                                 { logs: progress.logs ?? null },
                             ])
-                            .match({ id: row.id });
+                            .match({ id: id });
                         if (update_logs_error) {
                             console.log(update_logs_error);
                         }
@@ -115,7 +144,7 @@ async function processQueueItem(row: queueItem) {
                             .update([
                                 { prediction_id: progress.id },
                             ])
-                            .match({ id: row.id });
+                            .match({ id: id });
                         if (update_prediction_id_error) {
                             console.log(update_prediction_id_error);
                         }
@@ -125,7 +154,7 @@ async function processQueueItem(row: queueItem) {
                     }
                 }
             );
-            await $`mkdir -p ${row.user_id}`;
+            await $`mkdir -p ${user_id}`;
             await $`curl -o ${path} ${url}`;
             let fps_cmd = await $`ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 ${path}`;
             // fps_cmd will be in the form of "2997/100" and i want to add to the database only the number 29.97
@@ -134,7 +163,7 @@ async function processQueueItem(row: queueItem) {
             const { data, error } = await supabase
                 .from('metadata')
                 .update({ fps: fps })
-                .match({ id: row.video_id });
+                .match({ id: video_id });
 
             if (output) {
                 await supabase
@@ -142,15 +171,17 @@ async function processQueueItem(row: queueItem) {
                     .update([
                         { status: "succeeded" },
                     ])
-                    .match({ id: row.id });
+                    .match({ id: id });
                 const { data, error } = await supabase
                     .from('subs')
                     .insert([
-                        { id: row.video_id, user_id: row.user_id, subtitles: output },
+                        { id: video_id, user_id: user_id, subtitles: output },
                     ])
                     .select()
             }
-            await $`rm -rf ${row.user_id}`;
+
+            await uploadVideo(user_id, video_id);
+            await $`rm -rf ${user_id}`;
         } catch (error) {
             console.log(error);
         } finally {
@@ -158,21 +189,21 @@ async function processQueueItem(row: queueItem) {
             await supabase
                 .from("metadata")
                 .update([{ processed: true }])
-                .match({ id: row.video_id });
+                .match({ id: video_id });
 
             await supabase
                 .from("processing_queue")
                 .update([
                     { status: "done" },
                 ])
-                .match({ id: row.id });
+                .match({ id: id });
 
             await new Promise(resolve => setTimeout(resolve, 2000));
 
             const { error: delete_error } = await supabase
                 .from("processing_queue")
                 .delete()
-                .match({ id: row.id });
+                .match({ id: id });
 
             if (delete_error) {
                 console.log(delete_error);
