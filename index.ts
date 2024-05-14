@@ -1,5 +1,6 @@
 import Replicate, { Prediction } from "replicate";
 import S3 from 'aws-sdk/clients/s3.js';
+require("aws-sdk/lib/maintenance_mode_message").suppress = true;
 import { $ } from "bun";
 import { supabase } from "./scripts/supabaseClient";
 
