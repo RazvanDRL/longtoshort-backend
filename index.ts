@@ -72,7 +72,6 @@ async function processQueueItem(row: queueItem) {
     const video_id = row.video_id;
     const path = `${user_id}/${video_id}.mp4`;
     const url = await fetchVideo(user_id, video_id);
-
     if (url) {
         const controller = new AbortController();
         let cancelled = false;
@@ -90,7 +89,10 @@ async function processQueueItem(row: queueItem) {
         }, 600000); // 10 minutes
 
         try {
-            const output = await replicate.run(
+            await $`mkdir -p ${user_id}`;
+            await $`curl -o ${path} ${url}`;
+            const uploadPromise = uploadVideo(user_id, video_id);
+            const replicatePromise = await replicate.run(
                 `razvandrl/subtitler:${version}`,
                 {
                     input: {
@@ -155,8 +157,6 @@ async function processQueueItem(row: queueItem) {
                     }
                 }
             );
-            await $`mkdir -p ${user_id}`;
-            await $`curl -o ${path} ${url}`;
             let fps_cmd = await $`ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 ${path}`;
             // fps_cmd will be in the form of "2997/100" and i want to add to the database only the number 29.97
             let fps = parseFloat(fps_cmd.stdout.toString().split("/")[0]) / parseFloat(fps_cmd.stdout.toString().split("/")[1]);
@@ -165,6 +165,7 @@ async function processQueueItem(row: queueItem) {
                 .from('metadata')
                 .update({ fps: fps })
                 .match({ id: video_id });
+            const [output] = await Promise.all([replicatePromise, uploadPromise]);
 
             if (output) {
                 await supabase
@@ -180,8 +181,6 @@ async function processQueueItem(row: queueItem) {
                     ])
                     .select()
             }
-
-            await uploadVideo(user_id, video_id);
             await $`rm -rf ${user_id}`;
         } catch (error) {
             console.log(error);
