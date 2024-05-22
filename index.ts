@@ -1,3 +1,4 @@
+const Sentry = require('@sentry/node');
 import Replicate, { Prediction } from "replicate";
 import S3 from 'aws-sdk/clients/s3.js';
 require("aws-sdk/lib/maintenance_mode_message").suppress = true;
@@ -15,7 +16,7 @@ const s3 = new S3({
     signatureVersion: 'v4',
 });
 
-const version = "3cafb09bd68dc82d1c09f7f91d5f67451d61242b8acf83e9ad4e27422dc51b28";
+const version = "cc525b15161e0a53e440dcaed657700e0091d55d604a5204cb4167d985b6b919";
 
 type queueItem = {
     id: string;
@@ -30,6 +31,15 @@ type queueItem = {
 let lastKnownStatus: string | null = null;
 let lastKnownLogs: string | null = null;
 let preditctionID: string | null = null;
+
+Sentry.init({
+    dsn: "https://c3bd2da376e24c15f5f8275bc1accbeb@o4507060874641408.ingest.us.sentry.io/4507284793196544",
+    // Performance Monitoring
+    tracesSampleRate: 1.0, //  Capture 100% of the transactions
+
+    // Set sampling rate for profiling - this is relative to tracesSampleRate
+    profilesSampleRate: 1.0,
+});
 
 async function fetchVideo(user_id: string, video_id: string) {
     try {
@@ -92,6 +102,7 @@ async function processQueueItem(row: queueItem) {
             await $`mkdir -p ${user_id}`;
             await $`curl -o ${path} ${url}`;
             const uploadPromise = uploadVideo(user_id, video_id);
+
             const replicatePromise = await replicate.run(
                 `razvandrl/subtitler:${version}`,
                 {
@@ -103,7 +114,7 @@ async function processQueueItem(row: queueItem) {
                 },
                 async (progress: Prediction) => {
                     let cost = progress.metrics?.predict_time == undefined ? 0 : progress.metrics?.predict_time * 0.000225;
-                    console.log(progress.status, 'predict_time', progress.metrics?.predict_time, "$" + cost, new Date().getTime());
+                    console.log(progress.status, 'predict_time', progress.metrics?.predict_time, "$" + cost);
 
                     if (cancelled) {
                         await abortPrediction(controller);
@@ -165,6 +176,7 @@ async function processQueueItem(row: queueItem) {
                 .from('metadata')
                 .update({ fps: fps })
                 .match({ id: video_id });
+                
             const [output] = await Promise.all([replicatePromise, uploadPromise]);
 
             if (output) {
