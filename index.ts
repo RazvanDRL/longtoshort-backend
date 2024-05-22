@@ -16,7 +16,7 @@ const s3 = new S3({
     signatureVersion: 'v4',
 });
 
-const version = "cc525b15161e0a53e440dcaed657700e0091d55d604a5204cb4167d985b6b919";
+const version = "4f814ab261af320e7e46814f4fc86246e0f4ba40ae86309ba7616892770f241e";
 
 type queueItem = {
     id: string;
@@ -176,7 +176,7 @@ async function processQueueItem(row: queueItem) {
                 .from('metadata')
                 .update({ fps: fps })
                 .match({ id: video_id });
-                
+
             const [output] = await Promise.all([replicatePromise, uploadPromise]);
 
             if (output) {
