@@ -235,7 +235,7 @@ async function main() {
         const { data, error } = await supabase
             .from("processing_queue")
             .select('*')
-            .order('created_at', { ascending: false })
+            .order('created_at', { ascending: true })
             .limit(1);
 
         if (error) {
