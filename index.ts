@@ -183,7 +183,7 @@ async function processQueueItem(row: queueItem) {
                 await supabase
                     .from("processing_queue")
                     .update([
-                        { status: "succeeded" },
+                        { status: "loading" },
                     ])
                     .match({ id: id });
                 const { data, error } = await supabase
