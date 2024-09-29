@@ -1,9 +1,10 @@
-const Sentry = require('@sentry/node');
 import Replicate, { Prediction } from "replicate";
 import S3 from 'aws-sdk/clients/s3.js';
-require("aws-sdk/lib/maintenance_mode_message").suppress = true;
 import { $ } from "bun";
 import { supabase } from "./scripts/supabaseClient";
+import sendMessage from "./scripts/sendMessage";
+
+require("aws-sdk/lib/maintenance_mode_message").suppress = true;
 
 const replicate = new Replicate({
     auth: process.env.REPLICATE_API_TOKEN,
@@ -16,9 +17,10 @@ const s3 = new S3({
     signatureVersion: 'v4',
 });
 
-const version = "2774059f636228942fcd4b8caf5b1ef79f4671f742d65728f7c7538f8a5aedc8";
+const REPLICATE_MODEL_VERSION = "2774059f636228942fcd4b8caf5b1ef79f4671f742d65728f7c7538f8a5aedc8";
+const ABORT_TIMEOUT = 600000; // 10 minutes
 
-type queueItem = {
+type QueueItem = {
     id: string;
     user_id: string;
     video_id: string;
@@ -31,36 +33,32 @@ type queueItem = {
 
 let lastKnownStatus: string | null = null;
 let lastKnownLogs: string | null = null;
-let preditctionID: string | null = null;
+let predictionID: string | null = null;
 
-Sentry.init({
-    dsn: "https://c3bd2da376e24c15f5f8275bc1accbeb@o4507060874641408.ingest.us.sentry.io/4507284793196544",
-    // Performance Monitoring
-    tracesSampleRate: 1.0, //  Capture 100% of the transactions
-
-    // Set sampling rate for profiling - this is relative to tracesSampleRate
-    profilesSampleRate: 1.0,
-});
-
-async function fetchVideo(user_id: string, video_id: string) {
+async function fetchVideo(user_id: string, video_id: string): Promise<string | undefined> {
     try {
-        const url = await s3.getSignedUrlPromise('getObject', { Bucket: "upload-bucket", Key: `${user_id}/${video_id}.mp4`, Expires: 3600 });
-        return url;
+        return await s3.getSignedUrlPromise('getObject', {
+            Bucket: "upload-bucket",
+            Key: `${user_id}/${video_id}.mp4`,
+            Expires: 3600
+        });
     } catch (error) {
         console.error('Error fetching video:', error);
+        sendMessage(`Error fetching video: ${error}`);
+        return undefined;
     }
 }
 
-async function uploadVideo(user_id: string, video_id: string) {
+async function uploadVideo(user_id: string, video_id: string): Promise<void> {
     try {
         console.log('Compressing video');
         await $`ffmpeg -i ${user_id}/${video_id}.mp4 -vf "scale=iw/2:ih/2" ${user_id}/${video_id}-compressed.mp4`;
-
         console.log('Uploading video');
         const file = Bun.file(`${user_id}/${video_id}-compressed.mp4`);
 
-        if (await file.exists() == false) {
+        if (!await file.exists()) {
             console.log('File does not exist');
+            sendMessage(`File does not exist: ${user_id}/${video_id}-compressed.mp4`);
             return;
         }
 
@@ -72,33 +70,44 @@ async function uploadVideo(user_id: string, video_id: string) {
             body: file,
         });
 
-        if (!response.ok)
+        if (!response.ok) {
             throw new Error(`Failed to upload video: ${response.statusText}`);
-        else
-            console.log('Video uploaded');
+        }
+        console.log('Video uploaded');
     } catch (error) {
         console.error('Error uploading video:', error);
+        sendMessage(`Error uploading video: ${error}`);
     }
 }
 
-async function processQueueItem(row: queueItem) {
-    const id = row.id;
-    const user_id = row.user_id;
-    const video_id = row.video_id;
+async function updateSupabase(table: string, data: object, id: string): Promise<void> {
+    const { error } = await supabase
+        .from(table)
+        .update(data)
+        .match({ id });
+
+    if (error) {
+        console.error(`Error updating ${table}:`, error);
+        sendMessage(`Error updating ${table}: ${error}`);
+    }
+}
+
+async function processQueueItem(row: QueueItem): Promise<void> {
+    const { id, user_id, video_id } = row;
     const { data: credits, error: credits_error } = await supabase
         .from("profiles")
         .select("credits")
-        .eq("id", user_id);
+        .eq("id", user_id)
+        .single();
+
     if (credits_error) {
-        console.log(credits_error);
+        console.error('Error fetching credits:', credits_error);
+        sendMessage(`Error fetching credits: ${credits_error}`);
         return;
     }
-    if (credits && credits.length > 0 && credits[0].credits > 0) {
-        await supabase
-            .from("profiles")
-            .update({ credits: credits[0].credits - 1 })
-            .eq("id", user_id);
-        const path = `${user_id}/${video_id}.mp4`;
+
+    if (credits && credits.credits > 0) {
+        await updateSupabase("profiles", { credits: credits.credits - 1 }, user_id);
         const url = await fetchVideo(user_id, video_id);
         if (url) {
             const controller = new AbortController();
@@ -107,22 +116,17 @@ async function processQueueItem(row: queueItem) {
             const timer = setTimeout(async () => {
                 if (!cancelled) {
                     await abortPrediction(controller);
-                    await supabase
-                        .from("processing_queue")
-                        .update([
-                            { status: "aborted" },
-                        ])
-                        .match({ id: id });
+                    await updateSupabase("processing_queue", { status: "aborted" }, id);
                 }
-            }, 600000); // 10 minutes
+            }, ABORT_TIMEOUT);
 
             try {
                 await $`mkdir -p ${user_id}`;
-                await $`curl -o ${path} ${url}`;
+                await $`curl -o ${user_id}/${video_id}.mp4 ${url}`;
                 const uploadPromise = uploadVideo(user_id, video_id);
 
                 const replicatePromise = await replicate.run(
-                    `razvandrl/subtitler:${version}`,
+                    `razvandrl/subtitler:${REPLICATE_MODEL_VERSION}`,
                     {
                         input: {
                             file: url,
@@ -131,187 +135,156 @@ async function processQueueItem(row: queueItem) {
                         signal: controller.signal,
                     },
                     async (progress: Prediction) => {
-                        let cost = progress.metrics?.predict_time == undefined ? 0 : progress.metrics?.predict_time * 0.000225;
-                        console.log(progress.status, 'predict_time', progress.metrics?.predict_time, "$" + cost);
-
-                        if (cancelled) {
-                            await abortPrediction(controller);
-                            clearTimeout(timer);
-                            return;
-                        }
-
-                        if (lastKnownStatus !== progress.status) {
-                            const { data: update_status_data, error: update_status_error } = await supabase
-                                .from("processing_queue")
-                                .update([
-                                    { status: progress.status },
-                                ])
-                                .match({ id: id });
-                            if (update_status_error) {
-                                console.log(update_status_error);
-                            }
-                            else {
-                                lastKnownStatus = progress.status;
-                            }
-                        }
-
-                        if (lastKnownLogs !== progress.logs) {
-                            const { data: update_logs_data, error: update_logs_error } = await supabase
-                                .from("processing_queue")
-                                .update([
-                                    { logs: progress.logs ?? null },
-                                ])
-                                .match({ id: id });
-                            if (update_logs_error) {
-                                console.log(update_logs_error);
-                            }
-                            else {
-                                lastKnownLogs = progress.logs ?? null;
-                            }
-                        }
-
-                        if (preditctionID !== progress.id) {
-                            const { data: update_prediction_id_data, error: update_prediction_id_error } = await supabase
-                                .from("processing_queue")
-                                .update([
-                                    { prediction_id: progress.id },
-                                ])
-                                .match({ id: id });
-                            if (update_prediction_id_error) {
-                                console.log(update_prediction_id_error);
-                            }
-                            else {
-                                preditctionID = progress.id;
-                            }
-                        }
+                        await handleProgress(progress, id, cancelled, controller, timer as NodeJS.Timeout);
                     }
                 );
-                let fps_cmd = await $`ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 ${path}`;
-                // fps_cmd will be in the form of "2997/100" and i want to add to the database only the number 29.97
-                let fps = parseFloat(fps_cmd.stdout.toString().split("/")[0]) / parseFloat(fps_cmd.stdout.toString().split("/")[1]);
 
-                const { data, error } = await supabase
-                    .from('metadata')
-                    .update({ fps: fps })
-                    .match({ id: video_id });
-
+                await updateVideoMetadata(user_id, video_id);
                 const [output] = await Promise.all([replicatePromise, uploadPromise]);
 
                 if (output) {
+                    await updateSupabase("processing_queue", { status: "loading" }, id);
                     await supabase
-                        .from("processing_queue")
-                        .update([
-                            { status: "loading" },
-                        ])
-                        .match({ id: id });
-                    const { data, error } = await supabase
                         .from('subs')
                         .insert([
                             { id: video_id, user_id: user_id, subtitles: output },
                         ])
-                        .select()
+                        .select();
                 }
-                await $`rm -rf ${user_id}`;
             } catch (error) {
-                console.log(error);
+                console.error('Error processing queue item:', error);
+                sendMessage(`Error processing queue item: ${error}`);
             } finally {
-                clearTimeout(timer);
-                await supabase
-                    .from("metadata")
-                    .update([{ processed: true }])
-                    .match({ id: video_id });
-
-                await supabase
-                    .from("processing_queue")
-                    .update([
-                        { status: "done" },
-                    ])
-                    .match({ id: id });
-
-                await new Promise(resolve => setTimeout(resolve, 2000));
-
-                const { error: delete_error } = await supabase
-                    .from("processing_queue")
-                    .delete()
-                    .match({ id: id });
-
-                if (delete_error) {
-                    console.log(delete_error);
-                }
+                await cleanupProcessing(id, video_id, user_id);
             }
         }
+    } else {
+        await handleInsufficientCredits(id);
     }
-    else {
-        await supabase
-            .from("processing_queue")
-            .update([
-                { status: "no_credits" },
-            ])
-            .match({ id: id });
+}
+
+async function handleProgress(progress: Prediction, id: string, cancelled: boolean, controller: AbortController, timer: NodeJS.Timeout): Promise<void> {
+    const cost = progress.metrics?.predict_time ? progress.metrics.predict_time * 0.000225 : 0;
+    console.log(progress.status, 'predict_time', progress.metrics?.predict_time, "$" + cost);
+
+    if (cancelled) {
+        await abortPrediction(controller);
+        clearTimeout(timer);
+        return;
+    }
+
+    if (lastKnownStatus !== progress.status) {
+        await updateSupabase("processing_queue", { status: progress.status }, id);
+        lastKnownStatus = progress.status;
+    }
+
+    if (lastKnownLogs !== progress.logs) {
+        await updateSupabase("processing_queue", { logs: progress.logs ?? null }, id);
+        lastKnownLogs = progress.logs ?? null;
+    }
+
+    if (predictionID !== progress.id) {
+        await updateSupabase("processing_queue", { prediction_id: progress.id }, id);
+        predictionID = progress.id;
+    }
+}
+
+async function updateVideoMetadata(user_id: string, video_id: string): Promise<void> {
+    try {
+        const fps_cmd = await $`ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 ${user_id}/${video_id}.mp4`;
+        const [numerator, denominator] = fps_cmd.stdout.toString().trim().split('/');
+        const fps = parseFloat(numerator) / parseFloat(denominator);
+
+        await updateSupabase('metadata', { fps }, video_id);
+    } catch (error) {
+        console.error('Error updating video metadata:', error);
+        sendMessage(`Error updating video metadata: ${error}`);
+    }
+}
+
+async function cleanupProcessing(id: string, video_id: string, user_id: string): Promise<void> {
+    try {
+        await updateSupabase("metadata", { processed: true }, video_id);
+        await updateSupabase("processing_queue", { status: "done" }, id);
         await new Promise(resolve => setTimeout(resolve, 2000));
-
-        const { error: delete_error } = await supabase
-            .from("processing_queue")
-            .delete()
-            .match({ id: id });
-
-        if (delete_error) {
-            console.log(delete_error);
-        }
+        await supabase.from("processing_queue").delete().match({ id });
+        await $`rm -rf ${user_id}`;
+    } catch (error) {
+        console.error('Error during cleanup:', error);
+        sendMessage(`Error during cleanup: ${error}`);
     }
 }
 
-async function abortPrediction(controller: AbortController) {
-    controller.abort();
-    console.log("Prediction aborted");
+async function handleInsufficientCredits(id: string): Promise<void> {
+    try {
+        await updateSupabase("processing_queue", { status: "no_credits" }, id);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        await supabase.from("processing_queue").delete().match({ id });
+    } catch (error) {
+        console.error('Error handling insufficient credits:', error);
+        sendMessage(`Error handling insufficient credits: ${error}`);
+    }
 }
 
-async function main() {
+async function abortPrediction(controller: AbortController): Promise<void> {
+    try {
+        controller.abort();
+        console.log("Prediction aborted");
+    } catch (error) {
+        console.error('Error aborting prediction:', error);
+        sendMessage(`Error aborting prediction: ${error}`);
+    }
+}
+
+async function main(): Promise<void> {
     while (true) {
-        console.log("Checking for new items in the queue");
-        const { data, error } = await supabase
-            .from("processing_queue")
-            .select('*')
-            .order('created_at', { ascending: true })
-            .limit(1);
+        try {
+            console.log("Checking for new items in the queue");
+            const { data, error } = await supabase
+                .from("processing_queue")
+                .select('*')
+                .order('created_at', { ascending: true })
+                .limit(1);
 
-        if (error) {
-            console.log(error);
-        }
-
-        if (data && data.length > 0) {
-            lastKnownStatus = null;
-            lastKnownLogs = null;
-            preditctionID = null;
-            const credits = await supabase.from("profiles").select("credits").eq("id", data[0].user_id);
-            if (credits.error) {
-                console.log(credits.error);
+            if (error) {
+                console.error('Error fetching queue:', error);
+                sendMessage(`Error fetching queue: ${error}`);
                 continue;
             }
-            if (credits.data && credits.data.length > 0 && credits.data[0].credits > 0) {
-                await supabase
-                    .from("processing_queue")
-                    .update([
-                        { status: "processing" },
-                    ])
-                    .match({ id: data[0].id });
-                await processQueueItem(data[0]);
-            }
-            else {
-                const { error: delete_error } = await supabase
-                    .from("processing_queue")
-                    .delete()
-                    .match({ id: data[0].id });
 
-                if (delete_error) {
-                    console.log(delete_error);
+            if (data && data.length > 0) {
+                lastKnownStatus = null;
+                lastKnownLogs = null;
+                predictionID = null;
+                const { data: credits, error: creditsError } = await supabase
+                    .from("profiles")
+                    .select("credits")
+                    .eq("id", data[0].user_id)
+                    .single();
+
+                if (creditsError) {
+                    console.error('Error fetching credits:', creditsError);
+                    sendMessage(`Error fetching credits: ${creditsError}`);
+                    continue;
                 }
+
+                if (credits && credits.credits > 0) {
+                    await updateSupabase("processing_queue", { status: "processing" }, data[0].id);
+                    await processQueueItem(data[0]);
+                } else {
+                    await supabase.from("processing_queue").delete().match({ id: data[0].id });
+                }
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 2000));
             }
-        } else {
-            // If no new items in the queue, wait for some time before checking again
-            await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (error) {
+            console.error('Error in main loop:', error);
+            sendMessage(`Error in main loop: ${error}`);
         }
     }
 }
 
-main();
+main().catch(error => {
+    console.error('Unhandled error in main loop:', error);
+    sendMessage(`Unhandled error in main loop: ${error}`);
+});
