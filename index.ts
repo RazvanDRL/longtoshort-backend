@@ -52,7 +52,9 @@ async function fetchVideo(user_id: string, video_id: string): Promise<string | u
 async function uploadVideo(user_id: string, video_id: string): Promise<void> {
     try {
         console.log('Compressing video');
-        await $`ffmpeg -i ${user_id}/${video_id}.mp4 -vf "scale=iw/2:ih/2" ${user_id}/${video_id}-compressed.mp4`;
+        await $`ffmpeg -i ${user_id}/${video_id}.mp4 -c:v libx264 -preset faster -crf 26 -b:a 128k -vf "scale=iw/2:ih/2" ${user_id}/${video_id}-compressed.mp4`;
+        console.log('Video compressed');
+
         console.log('Uploading video');
         const file = Bun.file(`${user_id}/${video_id}-compressed.mp4`);
 
@@ -62,17 +64,14 @@ async function uploadVideo(user_id: string, video_id: string): Promise<void> {
             return;
         }
 
-        const response = await fetch(`${process.env.SITE_URL}/api/upload?key=${user_id}/${video_id}-compressed.mp4`, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'video/mp4',
-            },
-            body: file,
-        });
+        const params = {
+            Bucket: "upload-bucket",
+            Key: `${user_id}/${video_id}-compressed.mp4`,
+            Body: new Uint8Array(await file.arrayBuffer()),
+            ContentType: 'video/mp4'
+        };
 
-        if (!response.ok) {
-            throw new Error(`Failed to upload video: ${response.statusText}`);
-        }
+        await s3.upload(params).promise();
         console.log('Video uploaded');
     } catch (error) {
         console.error('Error uploading video:', error);
