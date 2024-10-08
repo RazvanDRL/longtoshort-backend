@@ -51,7 +51,7 @@ async function fetchVideo(user_id: string, video_id: string): Promise<string | u
 async function uploadVideo(user_id: string, video_id: string): Promise<void> {
     try {
         console.log('Compressing video');
-        await $`ffmpeg -i ${user_id}/${video_id}.mp4 -c:v libx264 -preset faster -crf 26 -b:a 128k -vf "scale=iw/2:ih/2" ${user_id}/${video_id}-compressed.mp4`;
+        await $`ffmpeg -i ${user_id}/${video_id}.mp4 -c:v libx264 -preset faster -crf 26 -b:a 128k -vf "scale=iw/2:ih/2" -threads 0 ${user_id}/${video_id}-compressed.mp4`;
         console.log('Video compressed');
 
         console.log('Uploading video');
