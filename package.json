@@ -12,11 +12,12 @@
     "dev": "bun run index.ts"
   },
   "dependencies": {
-    "@sentry/node": "^8.32.0",
+    "@sentry/node": "^8.33.1",
     "@supabase/supabase-js": "^2.45.4",
     "aws-sdk": "^2.1691.0",
     "googleapis": "^129.0.0",
-    "openai": "^4.65.0",
+    "openai": "^4.67.2",
+    "p-limit": "^6.1.0",
     "replicate": "^0.20.1",
     "resend": "^3.5.0",
     "sharp": "^0.33.5"
